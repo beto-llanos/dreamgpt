@@ -5,7 +5,11 @@ import path from "path";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// In production this points at a mounted Railway volume (WAITLIST_DIR=/data)
+// so captured emails survive redeploys. Falls back to the repo's ./data locally.
+const DATA_DIR = process.env.WAITLIST_DIR
+  ? process.env.WAITLIST_DIR
+  : path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "waitlist.json");
 
 // Basic, dependency-free email check — good enough for a waitlist.
@@ -80,8 +84,16 @@ export async function POST(request: Request) {
   return NextResponse.json({ ok: true, alreadyJoined: false });
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const entries = await readEntries();
-  const count = entries.length || memoryStore.length;
-  return NextResponse.json({ count });
+  const all = entries.length ? entries : memoryStore;
+
+  // Private admin view: GET /api/waitlist?key=ADMIN_KEY returns the full list.
+  // Without a matching key, only the count is exposed.
+  const key = new URL(request.url).searchParams.get("key");
+  if (process.env.ADMIN_KEY && key === process.env.ADMIN_KEY) {
+    return NextResponse.json({ count: all.length, entries: all });
+  }
+
+  return NextResponse.json({ count: all.length });
 }
