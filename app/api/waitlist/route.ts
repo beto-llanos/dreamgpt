@@ -155,3 +155,46 @@ export async function GET(request: Request) {
   if (isAdmin) return NextResponse.json({ count: all.length, entries: all });
   return NextResponse.json({ count: all.length });
 }
+
+// Admin-only cleanup: DELETE /api/waitlist?key=ADMIN_KEY&email=foo  (one)
+//                     DELETE /api/waitlist?key=ADMIN_KEY&all=1       (everything)
+export async function DELETE(request: Request) {
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key");
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  const email = url.searchParams.get("email")?.trim().toLowerCase();
+  const all = url.searchParams.get("all") === "1";
+  if (!email && !all) {
+    return NextResponse.json(
+      { error: "Pass ?email=... or ?all=1" },
+      { status: 400 }
+    );
+  }
+
+  const p = getPool();
+  if (p) {
+    try {
+      await ensureTable(p);
+      if (all) {
+        await p.query(`TRUNCATE waitlist RESTART IDENTITY`);
+      } else {
+        await p.query(`DELETE FROM waitlist WHERE email = $1`, [email]);
+      }
+      const res = await p.query(`SELECT count(*)::int AS c FROM waitlist`);
+      return NextResponse.json({ ok: true, count: res.rows[0].c });
+    } catch (err) {
+      console.error("waitlist: postgres delete failed, falling back to file", err);
+      // fall through
+    }
+  }
+
+  const entries = await fileRead();
+  const next = all ? [] : entries.filter((e) => e.email !== email);
+  await fileWrite(next);
+  memoryStore.length = 0;
+  if (!all) memoryStore.push(...next);
+  return NextResponse.json({ ok: true, count: next.length });
+}
