@@ -1,16 +1,10 @@
 import { NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
+import { Pool } from "pg";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-// In production this points at a mounted Railway volume (WAITLIST_DIR=/data)
-// so captured emails survive redeploys. Falls back to the repo's ./data locally.
-const DATA_DIR = process.env.WAITLIST_DIR
-  ? process.env.WAITLIST_DIR
-  : path.join(process.cwd(), "data");
-const DATA_FILE = path.join(DATA_DIR, "waitlist.json");
 
 // Basic, dependency-free email check — good enough for a waitlist.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -20,12 +14,49 @@ interface Entry {
   joinedAt: string;
 }
 
-// Fallback store for read-only filesystems (e.g. Vercel serverless),
-// where writing the JSON file will fail. Lives for the lifetime of the
-// serverless instance — enough to keep the form working in a demo deploy.
+/* -------------------------------------------------------------------------- */
+/* Primary store: Postgres (Railway). Durable across redeploys.               */
+/* -------------------------------------------------------------------------- */
+
+let pool: Pool | null = null;
+let tableReady = false;
+
+function getPool(): Pool | null {
+  if (!process.env.DATABASE_URL) return null;
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: false, // private network inside Railway; no TLS needed
+      max: 3,
+    });
+  }
+  return pool;
+}
+
+async function ensureTable(p: Pool) {
+  if (tableReady) return;
+  await p.query(
+    `CREATE TABLE IF NOT EXISTS waitlist (
+       id        SERIAL PRIMARY KEY,
+       email     TEXT UNIQUE NOT NULL,
+       joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`
+  );
+  tableReady = true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Fallback store: JSON file (mounted volume) + in-memory, if Postgres is     */
+/* unavailable. Keeps the form working no matter what.                        */
+/* -------------------------------------------------------------------------- */
+
+const DATA_DIR = process.env.WAITLIST_DIR
+  ? process.env.WAITLIST_DIR
+  : path.join(process.cwd(), "data");
+const DATA_FILE = path.join(DATA_DIR, "waitlist.json");
 const memoryStore: Entry[] = [];
 
-async function readEntries(): Promise<Entry[]> {
+async function fileRead(): Promise<Entry[]> {
   try {
     const raw = await fs.readFile(DATA_FILE, "utf8");
     const parsed = JSON.parse(raw);
@@ -35,7 +66,7 @@ async function readEntries(): Promise<Entry[]> {
   }
 }
 
-async function writeEntries(entries: Entry[]): Promise<boolean> {
+async function fileWrite(entries: Entry[]): Promise<boolean> {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.writeFile(DATA_FILE, JSON.stringify(entries, null, 2), "utf8");
@@ -45,11 +76,12 @@ async function writeEntries(entries: Entry[]): Promise<boolean> {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+
 export async function POST(request: Request) {
   let email: unknown;
   try {
-    const body = await request.json();
-    email = body?.email;
+    email = (await request.json())?.email;
   } catch {
     return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
@@ -63,37 +95,63 @@ export async function POST(request: Request) {
 
   const normalized = email.trim().toLowerCase();
 
-  const fileEntries = await readEntries();
-  const entries = fileEntries.length ? fileEntries : memoryStore;
-
-  if (entries.some((e) => e.email === normalized)) {
-    return NextResponse.json({ ok: true, alreadyJoined: true });
-  }
-
-  const entry: Entry = { email: normalized, joinedAt: new Date().toISOString() };
-  const next = [...entries, entry];
-
-  const persisted = await writeEntries(next);
-  if (!persisted) {
-    // Read-only FS: keep it in memory so the demo still succeeds.
-    if (!memoryStore.some((e) => e.email === normalized)) {
-      memoryStore.push(entry);
+  const p = getPool();
+  if (p) {
+    try {
+      await ensureTable(p);
+      const res = await p.query(
+        `INSERT INTO waitlist (email) VALUES ($1)
+         ON CONFLICT (email) DO NOTHING
+         RETURNING email`,
+        [normalized]
+      );
+      return NextResponse.json({ ok: true, alreadyJoined: res.rowCount === 0 });
+    } catch (err) {
+      console.error("waitlist: postgres write failed, falling back to file", err);
+      // fall through to file/memory
     }
   }
 
+  const fileEntries = await fileRead();
+  const entries = fileEntries.length ? fileEntries : memoryStore;
+  if (entries.some((e) => e.email === normalized)) {
+    return NextResponse.json({ ok: true, alreadyJoined: true });
+  }
+  const entry: Entry = { email: normalized, joinedAt: new Date().toISOString() };
+  if (!(await fileWrite([...entries, entry]))) {
+    if (!memoryStore.some((e) => e.email === normalized)) memoryStore.push(entry);
+  }
   return NextResponse.json({ ok: true, alreadyJoined: false });
 }
 
 export async function GET(request: Request) {
-  const entries = await readEntries();
-  const all = entries.length ? entries : memoryStore;
-
-  // Private admin view: GET /api/waitlist?key=ADMIN_KEY returns the full list.
-  // Without a matching key, only the count is exposed.
   const key = new URL(request.url).searchParams.get("key");
-  if (process.env.ADMIN_KEY && key === process.env.ADMIN_KEY) {
-    return NextResponse.json({ count: all.length, entries: all });
+  const isAdmin = !!process.env.ADMIN_KEY && key === process.env.ADMIN_KEY;
+
+  const p = getPool();
+  if (p) {
+    try {
+      await ensureTable(p);
+      if (isAdmin) {
+        const res = await p.query(
+          `SELECT email, joined_at FROM waitlist ORDER BY joined_at ASC`
+        );
+        const entries: Entry[] = res.rows.map((r) => ({
+          email: r.email,
+          joinedAt: new Date(r.joined_at).toISOString(),
+        }));
+        return NextResponse.json({ count: entries.length, entries });
+      }
+      const res = await p.query(`SELECT count(*)::int AS c FROM waitlist`);
+      return NextResponse.json({ count: res.rows[0].c });
+    } catch (err) {
+      console.error("waitlist: postgres read failed, falling back to file", err);
+      // fall through
+    }
   }
 
+  const fileEntries = await fileRead();
+  const all = fileEntries.length ? fileEntries : memoryStore;
+  if (isAdmin) return NextResponse.json({ count: all.length, entries: all });
   return NextResponse.json({ count: all.length });
 }
